@@ -1,0 +1,27 @@
+
+data/fer2013.csv
+data/processed_data/
+
+
+models/*.h5
+models/*.keras
+
+# Python cache
+__pycache__/
+*.pyc
+
+venv/
+env/
+.env
+
+
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

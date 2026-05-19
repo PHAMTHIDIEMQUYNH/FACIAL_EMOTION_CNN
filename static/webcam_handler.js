@@ -1,0 +1,1 @@
+//Xử lý chụp ảnh từ webcam gửi lên server
