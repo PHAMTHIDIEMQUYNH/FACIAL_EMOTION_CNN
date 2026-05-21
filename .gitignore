@@ -1,5 +1,35 @@
+<<<<<<< HEAD
 *.pkl 
 utils/preprocessed_data.pkl 
 data/ 
 venv/ 
 __pycache__/ 
+=======
+
+data/fer2013.csv
+data/processed_data/
+
+
+models/*.h5
+models/*.keras
+
+# Python cache
+__pycache__/
+*.pyc
+
+venv/
+env/
+.env
+
+
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+>>>>>>> b13cde9b01d516120cf95ff6d92bf4315ec7b3a3

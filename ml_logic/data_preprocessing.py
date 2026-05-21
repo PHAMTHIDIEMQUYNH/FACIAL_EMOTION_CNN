@@ -1,5 +1,3 @@
-
-
 import os
 import cv2
 import numpy as np
@@ -388,3 +386,4 @@ if __name__ == '__main__':
     print(f"  - X_train range: [{data['X_train'].min():.3f}, {data['X_train'].max():.3f}]")
     print(f"  - y_train shape: {data['y_train'].shape}")
     print(f"  - Sample label: {EMOTION_NAMES[np.argmax(data['y_train'][0])]}")
+
