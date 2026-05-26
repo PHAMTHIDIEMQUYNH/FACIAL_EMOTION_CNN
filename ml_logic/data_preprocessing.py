@@ -4,386 +4,606 @@ import numpy as np
 import pickle
 import random
 from collections import Counter
+import pandas as pd
 
 from sklearn.preprocessing import LabelBinarizer
 from sklearn.model_selection import train_test_split
-
-# Cách import đúng cho TensorFlow
-import tensorflow
-from tensorflow.keras.preprocessing.image import ImageDataGenerator # type: ignore
-
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.preprocessing.image import ImageDataGenerator  # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt
-# CẤU HÌNH
-DATASET_PATH = 'data'          # Thư mục gốc chứa train và test
-TARGET_SIZE = (48, 48)         # Kích thước ảnh đầu ra (48x48)
-BATCH_SIZE = 64                # Batch size cho training
 
-# Mapping emotion
-EMOTION_MAP = {
-    'angry': 0,
-    'disgust': 1,
-    'fear': 2,
-    'happy': 3,
-    'sad': 4,
-    'surprise': 5,
-    'neutral': 6
+# ==================== CẤU HÌNH ====================
+DATASET_PATHS = {
+    'fer2013': 'data/fer2013',
+    'ckplus':  'data/ckplus',
+    'jaffe':   'data/jaffe',
+    'sfew':    'data/sfew',
 }
 
-EMOTION_NAMES = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+TARGET_SIZE = (48, 48)
+USE_CLAHE   = True   # Bật CLAHE để cải thiện độ tương phản
+RANDOM_SEED = 42
+
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# ==================== EMOTION MAPPING ====================
+UNIFIED_EMOTIONS = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+EMOTION_TO_ID    = {e: i for i, e in enumerate(UNIFIED_EMOTIONS)}
+EMOTION_NAMES    = UNIFIED_EMOTIONS
+
+FER2013_MAP = {
+    0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy',
+    4: 'sad',   5: 'surprise', 6: 'neutral',
+}
+
+# CK+ label 3 = contempt (không có trong 7 nhãn chuẩn).
+# Mapping sang 'disgust' vì gần nghĩa nhất — có ghi chú rõ ràng.
+CKPLUS_LABEL_MAP = {
+    0: 'neutral',
+    1: 'angry',
+    2: 'disgust',
+    3: 'disgust',   # contempt → disgust (closest proxy)
+    4: 'fear',
+    5: 'happy',
+    6: 'sad',
+    7: 'surprise',
+}
+
+JAFFE_MAP = {
+    'AN': 'angry', 'DI': 'disgust', 'FE': 'fear',
+    'HA': 'happy', 'SA': 'sad',     'SU': 'surprise', 'NE': 'neutral',
+}
+
+SFEW_MAP = {
+    'Angry': 'angry', 'Disgust': 'disgust', 'Fear': 'fear',
+    'Happy': 'happy', 'Sad': 'sad',         'Surprise': 'surprise',
+    'Neutral': 'neutral',
+}
+
+# ==================== CLAHE ====================
+def apply_clahe(img: np.ndarray) -> np.ndarray:
+    """Áp dụng CLAHE để tăng độ tương phản ảnh xám."""
+    if USE_CLAHE:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(img)
+    return img
 
 
-# LOAD DỮ LIỆU 
+def _read_gray(path: str) -> np.ndarray | None:
+    """Đọc ảnh, chuyển về xám, resize, áp CLAHE. Trả None nếu lỗi."""
+    img = cv2.imread(path)
+    if img is None:
+        print(f"    ⚠️  Không đọc được: {path}")
+        return None
+    if len(img.shape) == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(img, TARGET_SIZE)
+    img = apply_clahe(img)
+    return img
 
-def load_images_from_folder(folder_path):
-   
-    images = []
-    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
-    
-    if not os.path.exists(folder_path):
-        print(f" Thư mục không tồn tại: {folder_path}")
-        return images
-    
-    for filename in os.listdir(folder_path):
-        if filename.lower().endswith(valid_extensions):
-            img_path = os.path.join(folder_path, filename)
-            try:
-                # Đọc ảnh dưới dạng grayscale
-                img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-                if img is not None:
-                    # Resize về kích thước chuẩn (48,48)
-                    img = cv2.resize(img, TARGET_SIZE)
-                    images.append(img)
-                else:
-                    print(f" Không thể đọc ảnh: {img_path}")
-            except Exception as e:
-                print(f"Lỗi khi đọc {img_path}: {e}")
-    
-    return images
 
-def load_dataset_from_structure(base_path=DATASET_PATH):
+# ==================== LOAD FER2013 ====================
+# FER2013 đã có split sẵn → giữ nguyên cấu trúc train/test.
+# Toàn bộ ảnh được load, split train/test sẽ tôn trọng nguồn gốc split này
+# bằng cách đánh dấu qua trường `split` trong metadata.
 
-    print("="*60)
-    print("BẮT ĐẦU LOAD DỮ LIỆU TỪ THƯ MỤC")
-    print("="*60)
-    
-    # Kiểm tra thư mục gốc
-    if not os.path.exists(base_path):
-        raise FileNotFoundError(f"Không tìm thấy thư mục {base_path}")
-    
-    train_path = os.path.join(base_path, 'train')
-    test_path = os.path.join(base_path, 'test')
-    
+def load_fer2013(base_path: str):
+    """
+    Trả về (images, labels, subjects, splits, sources)
+    - subjects: None vì FER2013 không có subject ID
+    - splits  : 'train' hoặc 'test' theo cấu trúc thư mục gốc
+    """
+    print(f"\n📁 Loading FER2013 from {base_path}")
+    images, labels, subjects, splits, sources = [], [], [], [], []
+    skipped = 0
+
+    for split in ['train', 'test']:
+        split_path = os.path.join(base_path, split)
+        if not os.path.exists(split_path):
+            continue
+        for emotion_folder in os.listdir(split_path):
+            emotion_path = os.path.join(split_path, emotion_folder)
+            if not os.path.isdir(emotion_path):
+                continue
+            emotion_name = emotion_folder.lower()
+            if emotion_name not in EMOTION_TO_ID:
+                continue
+            emotion_id = EMOTION_TO_ID[emotion_name]
+            for img_file in os.listdir(emotion_path):
+                if not img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    continue
+                img = _read_gray(os.path.join(emotion_path, img_file))
+                if img is None:
+                    skipped += 1
+                    continue
+                images.append(img)
+                labels.append(emotion_id)
+                subjects.append(None)   # không có subject ID
+                splits.append(split)    # giữ nguyên split gốc
+                sources.append('FER2013')
+
+    print(f"  ✓ FER2013: {len(images)} ảnh  |  bỏ qua: {skipped}")
+    return images, labels, subjects, splits, sources
+
+
+# ==================== LOAD CK+ ====================
+# CK+ chỉ dùng train folder; subject ID được lưu lại để
+# thực hiện subject-aware split (tránh subject leakage).
+
+def load_ckplus(base_path: str):
+    print(f"\n📁 Loading CK+ from {base_path}")
+    images, labels, subjects, splits, sources = [], [], [], [], []
+    skipped = 0
+
+    dataset_path = os.path.join(base_path, 'DATASET')
+    label_csv    = os.path.join(base_path, 'train_labels.csv')
+
+    if not os.path.exists(dataset_path):
+        print("  ⚠️  Không tìm thấy thư mục DATASET")
+        return images, labels, subjects, splits, sources
+    if not os.path.exists(label_csv):
+        print("  ⚠️  Không tìm thấy train_labels.csv")
+        return images, labels, subjects, splits, sources
+
+    df = pd.read_csv(label_csv)
+    filename_to_label = dict(zip(df['image'], df['label']))
+    print(f"  CSV: {len(df)} nhãn")
+
+    # Chỉ dùng thư mục train — bỏ qua test để tránh leakage
+    train_path = os.path.join(dataset_path, 'train')
     if not os.path.exists(train_path):
-        raise FileNotFoundError(f"Không tìm thấy thư mục train: {train_path}")
-    if not os.path.exists(test_path):
-        raise FileNotFoundError(f"Không tìm thấy thư mục test: {test_path}")
-    
-    # Load train data 
-    print(f"\n Đang load TRAIN data từ: {train_path}")
-    X_train, y_train = [], []
-    
-    for emotion_name, emotion_id in EMOTION_MAP.items():
-        emotion_folder = os.path.join(train_path, emotion_name)
-        if os.path.exists(emotion_folder):
-            images = load_images_from_folder(emotion_folder)
-            print(f"  - {emotion_name}: {len(images)} ảnh")
-            X_train.extend(images)
-            y_train.extend([emotion_id] * len(images))
-        else:
-            print(f" Không tìm thấy: {emotion_folder}")
-    
-    # --- Load test data ---
-    print(f"\n Đang load TEST data từ: {test_path}")
-    X_test, y_test = [], []
-    
-    for emotion_name, emotion_id in EMOTION_MAP.items():
-        emotion_folder = os.path.join(test_path, emotion_name)
-        if os.path.exists(emotion_folder):
-            images = load_images_from_folder(emotion_folder)
-            print(f"  - {emotion_name}: {len(images)} ảnh")
-            X_test.extend(images)
-            y_test.extend([emotion_id] * len(images))
-        else:
-            print(f" Không tìm thấy: {emotion_folder}")
-    
-    # Chuyển đổi sang numpy array
-    X_train = np.array(X_train, dtype=np.float32)
-    y_train = np.array(y_train)
-    X_test = np.array(X_test, dtype=np.float32)
-    y_test = np.array(y_test)
-    
-    # Kiểm tra dữ liệu rỗng
-    if len(X_train) == 0:
-        raise ValueError(" Không có ảnh nào trong thư mục train!")
-    if len(X_test) == 0:
-        raise ValueError(" Không có ảnh nào trong thư mục test!")
-    
-    print(f"\n LOAD DỮ LIỆU THÀNH CÔNG!")
-    print(f"  - Train: {X_train.shape[0]} ảnh")
-    print(f"  - Test: {X_test.shape[0]} ảnh")
-    print(f"  - Kích thước ảnh: {X_train.shape[1]}x{X_train.shape[2]}")
-    print(f"  - Giá trị pixel: [{X_train.min():.0f}, {X_train.max():.0f}]")
-    
-    return X_train, y_train, X_test, y_test
+        print("  ⚠️  Không tìm thấy thư mục train")
+        return images, labels, subjects, splits, sources
+
+    for subject_id in os.listdir(train_path):
+        subject_path = os.path.join(train_path, subject_id)
+        if not os.path.isdir(subject_path):
+            continue
+        for img_file in os.listdir(subject_path):
+            if not img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                continue
+            if img_file not in filename_to_label:
+                continue
+            label_num = filename_to_label[img_file]
+            if label_num not in CKPLUS_LABEL_MAP:
+                continue
+            emotion_name = CKPLUS_LABEL_MAP[label_num]
+            if emotion_name not in EMOTION_TO_ID:
+                continue
+            img = _read_gray(os.path.join(subject_path, img_file))
+            if img is None:
+                skipped += 1
+                continue
+            images.append(img)
+            labels.append(EMOTION_TO_ID[emotion_name])
+            subjects.append(f"CKP_{subject_id}")   # subject ID để split
+            splits.append('train')
+            sources.append('CK+')
+
+    print(f"  ✓ CK+: {len(images)} ảnh  |  bỏ qua: {skipped}")
+    return images, labels, subjects, splits, sources
 
 
-# TIỀN XỬ LÝ ẢNH 
+# ==================== LOAD JAFFE ====================
+# JAFFE chỉ có 10 subject, ~213 ảnh → dùng để augment train,
+# KHÔNG đưa vào test (tránh overestimate do tập quá nhỏ).
 
-def preprocess_images(images):
-   
-    print("\n Đang tiền xử lý ảnh...")
-    
-    # Normalization (0-255 -> 0-1)
-    images_normalized = images.astype('float32') / 255.0
-    
-    # Thêm channel dimension cho CNN
-    images_processed = np.expand_dims(images_normalized, axis=-1)
-    
-    print(f" Đã normalize ảnh về [0, 1]")
-    print(f" Shape sau xử lý: {images_processed.shape}")
-    
-    return images_processed
+def load_jaffe(base_path: str):
+    print(f"\n📁 Loading JAFFE from {base_path}")
+    images, labels, subjects, splits, sources = [], [], [], [], []
+    skipped = 0
 
+    if not os.path.exists(base_path):
+        print("  ⚠️  Không tìm thấy thư mục JAFFE")
+        return images, labels, subjects, splits, sources
 
-# ENCODE LABELS 
+    for file in os.listdir(base_path):
+        if not file.lower().endswith(('.tiff', '.tif')):
+            continue
+        parts = file.split('.')
+        if len(parts) < 2:
+            continue
+        emotion_code = parts[1].upper()[:2]
+        if emotion_code not in JAFFE_MAP:
+            continue
+        # Trích subject ID từ tên file (vd: KA.AN1.39 → subject = "KA")
+        subject_id = parts[0][:2].upper()
+        img = _read_gray(os.path.join(base_path, file))
+        if img is None:
+            skipped += 1
+            continue
+        images.append(img)
+        labels.append(EMOTION_TO_ID[JAFFE_MAP[emotion_code]])
+        subjects.append(f"JFF_{subject_id}")
+        splits.append('train')   # JAFFE chỉ vào train pool
+        sources.append('JAFFE')
 
-def encode_labels(y_train, y_test):
-    
-    print("\n Đang xử lý nhãn...")
-    
-    # Thống kê phân bố nhãn
-    print("Phân bố nhãn TRAIN:")
-    train_counts = Counter(y_train)
-    for emotion_id, count in sorted(train_counts.items()):
-        print(f"  {EMOTION_NAMES[emotion_id]}: {count} ảnh ({count/len(y_train)*100:.1f}%)")
-    
-    print("\nPhân bố nhãn TEST:")
-    test_counts = Counter(y_test)
-    for emotion_id, count in sorted(test_counts.items()):
-        print(f"  {EMOTION_NAMES[emotion_id]}: {count} ảnh ({count/len(y_test)*100:.1f}%)")
-    
-    # One-hot encoding
-    encoder = LabelBinarizer()
-    y_train_encoded = encoder.fit_transform(y_train)
-    y_test_encoded = encoder.transform(y_test)
-    
-    print(f"\n Đã encode labels (shape: {y_train_encoded.shape})")
-    
-    return y_train_encoded, y_test_encoded, encoder
+    print(f"  ✓ JAFFE: {len(images)} ảnh  |  bỏ qua: {skipped}")
+    print("  ℹ️  JAFFE chỉ dùng cho train pool (10 subjects, ~213 ảnh)")
+    return images, labels, subjects, splits, sources
 
 
-# TẠO VALIDATION SET
+# ==================== LOAD SFEW ====================
+# SFEW đã có benchmark split Train/Val/Test từ tác giả.
+# → PHẢI tôn trọng split này, KHÔNG gộp rồi re-split ngẫu nhiên.
 
-def create_validation_set(X_train, y_train, val_size=0.1, random_state=42):
+def load_sfew(base_path: str):
+    print(f"\n📁 Loading SFEW from {base_path}")
+    images, labels, subjects, splits, sources = [], [], [], [], []
+    skipped = 0
 
-    print(f"\n Đang tách validation set ({val_size*100:.0f}% từ train)...")
-    
-    # Lấy nhãn dạng số để phân tầng
-    y_train_int = np.argmax(y_train, axis=1)
-    
-    X_train_new, X_val, y_train_new, y_val = train_test_split(
+    # Chú ý: chỉ map 'Train' và 'Val' sang 'train'; 'Test' giữ nguyên.
+    # Val của SFEW → đưa vào validation pool riêng (không trộn vào train).
+    sfew_split_map = {'Train': 'sfew_train', 'Val': 'sfew_val', 'Test': 'sfew_test'}
+
+    for sfew_split, internal_split in sfew_split_map.items():
+        split_path = os.path.join(base_path, sfew_split)
+        if not os.path.exists(split_path):
+            continue
+        for emotion_folder in os.listdir(split_path):
+            if emotion_folder not in SFEW_MAP:
+                continue
+            emotion_path = os.path.join(split_path, emotion_folder)
+            if not os.path.isdir(emotion_path):
+                continue
+            emotion_id = EMOTION_TO_ID[SFEW_MAP[emotion_folder]]
+            for img_file in os.listdir(emotion_path):
+                if not img_file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                    continue
+                img = _read_gray(os.path.join(emotion_path, img_file))
+                if img is None:
+                    skipped += 1
+                    continue
+                images.append(img)
+                labels.append(emotion_id)
+                subjects.append(None)
+                splits.append(internal_split)
+                sources.append('SFEW')
+
+    print(f"  ✓ SFEW: {len(images)} ảnh  |  bỏ qua: {skipped}")
+    print("  ℹ️  Giữ nguyên split Train/Val/Test benchmark của SFEW")
+    return images, labels, subjects, splits, sources
+
+
+# ==================== SUBJECT-AWARE SPLIT ====================
+
+def subject_aware_test_split(images, labels, subjects, splits, sources,
+                             test_size: float = 0.2):
+    """
+    Tách test set theo nguyên tắc:
+    1. FER2013: dùng split gốc ('test') làm test pool, lấy 20% ngẫu nhiên
+       từ đó nếu test_size < 1.0.
+    2. SFEW   : dùng sfew_test làm test pool.
+    3. CK+    : split theo subject ID (không để cùng 1 người ở train lẫn test).
+    4. JAFFE  : hoàn toàn vào train — không đưa vào test.
+
+    Trả về (train_idx, test_idx) — danh sách index trong mảng gốc.
+    """
+    images   = np.array(images,   dtype=object)
+    labels   = np.array(labels)
+    subjects = np.array(subjects, dtype=object)
+    splits   = np.array(splits,   dtype=str)
+    sources  = np.array(sources,  dtype=str)
+
+    train_idx, test_idx = [], []
+
+    # ---------- FER2013 ----------
+    fer_mask = sources == 'FER2013'
+    fer_train_mask = fer_mask & (splits == 'train')
+    fer_test_mask  = fer_mask & (splits == 'test')
+    train_idx.extend(np.where(fer_train_mask)[0].tolist())
+    test_idx.extend(np.where(fer_test_mask)[0].tolist())
+
+    # ---------- CK+ (subject-aware) ----------
+    ckp_mask     = sources == 'CK+'
+    ckp_indices  = np.where(ckp_mask)[0]
+    ckp_subjects = subjects[ckp_indices]
+    unique_subj  = np.unique([s for s in ckp_subjects if s is not None])
+
+    if len(unique_subj) > 0:
+        n_test_subj = max(1, int(len(unique_subj) * test_size))
+        rng = np.random.default_rng(RANDOM_SEED)
+        test_subjects = set(rng.choice(unique_subj, size=n_test_subj, replace=False))
+        for idx in ckp_indices:
+            if subjects[idx] in test_subjects:
+                test_idx.append(int(idx))
+            else:
+                train_idx.append(int(idx))
+        print(f"  CK+ subject split: "
+              f"{len(unique_subj) - n_test_subj} train subjects, "
+              f"{n_test_subj} test subjects")
+
+    # ---------- JAFFE → chỉ train ----------
+    jaffe_mask = sources == 'JAFFE'
+    train_idx.extend(np.where(jaffe_mask)[0].tolist())
+
+    # ---------- SFEW (giữ nguyên benchmark split) ----------
+    sfew_train_mask = sources == 'SFEW'
+    for idx in np.where(sfew_train_mask)[0]:
+        sp = splits[idx]
+        if sp == 'sfew_test':
+            test_idx.append(int(idx))
+        else:   # sfew_train + sfew_val → đưa vào train pool
+            train_idx.append(int(idx))
+
+    return np.array(train_idx), np.array(test_idx)
+
+
+# ==================== MAIN LOADER ====================
+
+def load_all_datasets(use_datasets=None):
+    if use_datasets is None:
+        use_datasets = ['fer2013', 'ckplus', 'jaffe', 'sfew']
+
+    all_images, all_labels, all_subjects, all_splits, all_sources = [], [], [], [], []
+
+    print("=" * 60)
+    print("🔄 LOADING MULTIPLE DATASETS")
+    print("=" * 60)
+
+    loaders = {
+        'fer2013': load_fer2013,
+        'ckplus':  load_ckplus,
+        'jaffe':   load_jaffe,
+        'sfew':    load_sfew,
+    }
+
+    for name in use_datasets:
+        path = DATASET_PATHS.get(name)
+        if not path or not os.path.exists(path):
+            print(f"⚠️  Dataset '{name}' không tìm thấy tại: {path}")
+            continue
+        imgs, lbls, subjs, spls, srcs = loaders[name](path)
+        if imgs:
+            all_images.extend(imgs)
+            all_labels.extend(lbls)
+            all_subjects.extend(subjs)
+            all_splits.extend(spls)
+            all_sources.extend(srcs)
+
+    if not all_images:
+        raise ValueError("❌ Không load được dữ liệu từ bất kỳ dataset nào!")
+
+    print("\n" + "=" * 60)
+    print("✅ TỔNG HỢP DỮ LIỆU")
+    print("=" * 60)
+    print(f"  Tổng: {len(all_images)} ảnh")
+
+    label_counts = Counter(all_labels)
+    for eid, cnt in sorted(label_counts.items()):
+        pct = cnt / len(all_labels) * 100
+        bar = '█' * int(pct / 2)
+        print(f"  {EMOTION_NAMES[eid]:10s}: {cnt:5d} ({pct:5.1f}%) {bar}")
+
+    src_counts = Counter(all_sources)
+    print("\n  Theo nguồn:")
+    for src, cnt in src_counts.items():
+        print(f"  {src:10s}: {cnt:5d}")
+
+    return all_images, all_labels, all_subjects, all_splits, all_sources
+
+
+# ==================== TIỀN XỬ LÝ ====================
+
+def preprocess_images(images) -> np.ndarray:
+    arr = np.array(images, dtype='float32') / 255.0
+    return np.expand_dims(arr, axis=-1)
+
+
+def create_validation_set(X_train, y_train, val_size=0.1):
+    print(f"\n📊 Tách validation ({val_size*100:.0f}% từ train)...")
+    y_int = np.argmax(y_train, axis=1)
+    X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train,
-        test_size=val_size,
-        random_state=random_state,
-        stratify=y_train_int
+        test_size=val_size, random_state=RANDOM_SEED, stratify=y_int
     )
-    
-    print(f"✓ Train mới: {X_train_new.shape[0]} ảnh")
-    print(f"✓ Validation: {X_val.shape[0]} ảnh")
-    
-    return X_train_new, X_val, y_train_new, y_val
+    print(f"  Train: {len(X_tr)}  |  Val: {len(X_val)}")
+    return X_tr, X_val, y_tr, y_val
 
 
-# DATA AUGMENTATION 
-
-def create_augmentation_generator():
-    
-    print("\n Cấu hình data augmentation:")
-    
-    datagen = ImageDataGenerator(
-        rotation_range=20,          # Xoay ±20 độ
-        width_shift_range=0.1,      # Dịch ngang 10%
-        height_shift_range=0.1,     # Dịch dọc 10%
-        zoom_range=0.1,             # Zoom ±10%
-        horizontal_flip=True,       # Lật ngang
-        fill_mode='nearest'         # Điền pixel gần nhất
-    )
-    
-    print("  ✓ Rotation: ±20°")
-    print("  ✓ Width shift: ±10%")
-    print("  ✓ Height shift: ±10%")
-    print("  ✓ Zoom: ±10%")
-    print("  ✓ Horizontal flip: True")
-    
-    return datagen
+def compute_class_weights(y_train_encoded) -> dict:
+    y_int = np.argmax(y_train_encoded, axis=1)
+    cw = compute_class_weight('balanced', classes=np.unique(y_int), y=y_int)
+    return dict(enumerate(cw))
 
 
-# LƯU DỮ LIỆU 
+def get_augmentation_config() -> dict:
+    """Trả về config augmentation dưới dạng dict để lưu vào pkl."""
+    return {
+        'rotation_range':    15,
+        'width_shift_range': 0.1,
+        'height_shift_range': 0.1,
+        'shear_range':       0.1,
+        'zoom_range':        0.1,
+        'horizontal_flip':   True,
+        'brightness_range':  [0.8, 1.2],
+        'fill_mode':         'nearest',
+    }
 
-def save_preprocessed_data(X_train, y_train, X_val, y_val, X_test, y_test, 
-                          encoder, save_path='utils/preprocessed_data.pkl'):
-    
-    print(f"\n Đang lưu dữ liệu vào {save_path}...")
-    
-    # Tạo thư mục nếu chưa tồn tại
+
+def create_augmentation_generator() -> ImageDataGenerator:
+    return ImageDataGenerator(**get_augmentation_config())
+
+
+# ==================== SAVE ====================
+
+def save_preprocessed_data(X_train, y_train, X_val, y_val, X_test, y_test,
+                            encoder, class_weights,
+                            save_path='utils/preprocessed_data.pkl'):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
-    # Đóng gói dữ liệu
-    preprocessed_data = {
+
+    y_int = np.argmax(y_train, axis=1)
+    class_dist_named = {EMOTION_NAMES[k]: v
+                        for k, v in Counter(y_int.tolist()).items()}
+
+    data = {
         'X_train': X_train,
         'y_train': y_train,
-        'X_val': X_val,
-        'y_val': y_val,
-        'X_test': X_test,
-        'y_test': y_test,
+        'X_val':   X_val,
+        'y_val':   y_val,
+        'X_test':  X_test,
+        'y_test':  y_test,
         'encoder': encoder,
+        'class_weights': class_weights,
+        'augmentation_config': get_augmentation_config(),   # ← lưu config augment
         'metadata': {
-            'num_classes': 7,
-            'image_shape': X_train.shape[1:],
-            'train_samples': len(X_train),
-            'val_samples': len(X_val),
-            'test_samples': len(X_test),
-            'emotion_names': EMOTION_NAMES
-        }
+            'num_classes':        7,
+            'image_shape':        X_train.shape[1:],
+            'train_samples':      len(X_train),
+            'val_samples':        len(X_val),
+            'test_samples':       len(X_test),
+            'emotion_names':      EMOTION_NAMES,
+            'class_distribution': class_dist_named,
+            'used_clahe':         USE_CLAHE,
+            'random_seed':        RANDOM_SEED,
+            'split_strategy':     (
+                'FER2013: split gốc | '
+                'CK+: subject-aware | '
+                'JAFFE: train only | '
+                'SFEW: benchmark split'
+            ),
+        },
     }
-    
-    # Ghi file
+
     with open(save_path, 'wb') as f:
-        pickle.dump(preprocessed_data, f)
-    
-    file_size = os.path.getsize(save_path) / 1024 / 1024
-    print(f"✓ Đã lưu thành công! (Kích thước: {file_size:.2f} MB)")
+        pickle.dump(data, f)
+
+    print(f"\n💾 Đã lưu → {save_path}")
+    print(f"  Phân bố class (train): {class_dist_named}")
 
 
-# TRỰC QUAN HÓA DỮ LIỆU 
+# ==================== VISUALIZE ====================
 
-def visualize_samples(images, labels, num_samples=10, save_path='utils/data_samples.png'):
-   
-    # Chọn ngẫu nhiên num_samples ảnh
+def visualize_samples(images, labels, num_samples=16, save_path='utils/data_samples.png'):
     indices = random.sample(range(len(images)), min(num_samples, len(images)))
-    
-    # Tạo figure
-    cols = 5
-    rows = (num_samples + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(15, 3*rows))
+    cols = 4
+    rows = (len(indices) + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 3 * rows))
     axes = axes.flatten()
-    
-    for idx, ax in enumerate(axes):
-        if idx < len(indices):
-            i = indices[idx]
-            # Lấy ảnh (bỏ channel dimension)
-            img = images[i].squeeze()
-            
-            # Lấy nhãn - SỬA PHẦN NÀY
-            label_data = labels[i]
-            # Kiểm tra và chuyển đổi label về số nguyên
-            if hasattr(label_data, 'shape') and len(label_data.shape) > 1:
-                label_idx = np.argmax(label_data)  # one-hot
-            elif hasattr(label_data, '__len__') and len(label_data) > 1:
-                label_idx = np.argmax(label_data)  # array-like
-            else:
-                label_idx = int(label_data) if hasattr(label_data, '__int__') else label_data
-            
-            # Đảm bảo là số nguyên
-            label_idx = int(label_idx)
-            emotion = EMOTION_NAMES[label_idx]
-            
+
+    for i, ax in enumerate(axes):
+        if i < len(indices):
+            img = images[indices[i]].squeeze()
+            y = labels[indices[i]]
+            label_idx = int(np.argmax(y)) if (np.ndim(y) > 0 and len(y) > 1) else int(y)
             ax.imshow(img, cmap='gray')
-            ax.set_title(emotion, fontsize=12, fontweight='bold')
-            ax.axis('off')
-        else:
-            ax.axis('off')
-    
-    plt.suptitle('FER Dataset Samples (48x48 grayscale)', fontsize=16, fontweight='bold')
+            ax.set_title(EMOTION_NAMES[label_idx], fontsize=11)
+        ax.axis('off')
+
     plt.tight_layout()
-    
-    # Lưu ảnh
-    os.makedirs('utils', exist_ok=True)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"\n Đã lưu ảnh mẫu vào: {save_path}")
     plt.close()
+    print(f"📸 Lưu ảnh mẫu → {save_path}")
 
 
-# MAIN PIPELINE
+def visualize_split_distribution(y_train, y_val, y_test,
+                                  save_path='utils/split_distribution.png'):
+    """Vẽ biểu đồ phân bố nhãn qua các split để kiểm tra cân bằng."""
+    splits = {'Train': y_train, 'Val': y_val, 'Test': y_test}
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    for ax, (name, y_enc) in zip(axes, splits.items()):
+        y_int = np.argmax(y_enc, axis=1)
+        counts = [Counter(y_int.tolist()).get(i, 0) for i in range(7)]
+        ax.bar(EMOTION_NAMES, counts, color='steelblue', alpha=0.8)
+        ax.set_title(f"{name} ({len(y_int)} ảnh)")
+        ax.set_xticklabels(EMOTION_NAMES, rotation=30, ha='right', fontsize=9)
+        ax.set_ylabel('Số lượng')
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"📊 Lưu biểu đồ phân bố → {save_path}")
+
+
+# ==================== MAIN ====================
 
 def main():
-    
-    print("\n" + "="*60)
-    print(" BẮT ĐẦU TIỀN XỬ LÝ DỮ LIỆU CẢM XÚC KHUÔN MẶT")
-    print("="*60)
-    
-    # 1. Load dữ liệu thô từ thư mục
-    X_train_raw, y_train_raw, X_test_raw, y_test_raw = load_dataset_from_structure(DATASET_PATH)
-    
-    # 2. Tiền xử lý ảnh (normalize + channel)
-    X_train_processed = preprocess_images(X_train_raw)
-    X_test_processed = preprocess_images(X_test_raw)
-    
-    # 3. Encode labels (one-hot)
-    y_train_encoded, y_test_encoded, encoder = encode_labels(y_train_raw, y_test_raw)
-    
-    # 4. Tạo validation set (10% từ train)
-    X_train_final, X_val, y_train_final, y_val = create_validation_set(
-        X_train_processed, y_train_encoded, val_size=0.1
+    print("\n" + "=" * 60)
+    print("🚀 MULTI-DATASET PREPROCESSING")
+    print("   FER2013 + CK+ + JAFFE + SFEW")
+    print(f"   CLAHE: {'ON' if USE_CLAHE else 'OFF'} | Seed: {RANDOM_SEED}")
+    print("=" * 60)
+
+    # 1. Load toàn bộ dữ liệu với metadata đầy đủ
+    all_images, all_labels, all_subjects, all_splits, all_sources = load_all_datasets()
+
+    # 2. Tách train/test theo chiến lược phù hợp từng dataset
+    print("\n📂 Tách train/test (subject-aware + benchmark splits)...")
+    train_idx, test_idx = subject_aware_test_split(
+        all_images, all_labels, all_subjects, all_splits, all_sources,
+        test_size=0.2
     )
-    
-    # 5. Tạo data augmentation generator (cho team train sử dụng)
+
+    # Shuffle train index (đã seed)
+    rng = np.random.default_rng(RANDOM_SEED)
+    rng.shuffle(train_idx)
+
+    all_images_arr = np.array(all_images, dtype=object)
+    all_labels_arr = np.array(all_labels)
+
+    X_train_raw = np.stack(all_images_arr[train_idx])
+    y_train_raw = all_labels_arr[train_idx]
+    X_test_raw  = np.stack(all_images_arr[test_idx])
+    y_test_raw  = all_labels_arr[test_idx]
+
+    print(f"\n  Train pool : {len(X_train_raw)} ảnh")
+    print(f"  Test  pool : {len(X_test_raw)} ảnh")
+
+    # 3. Tiền xử lý ảnh
+    X_train_proc = preprocess_images(X_train_raw)
+    X_test_proc  = preprocess_images(X_test_raw)
+
+    # 4. Encode nhãn
+    encoder = LabelBinarizer()
+    y_train_enc = encoder.fit_transform(y_train_raw)
+    y_test_enc  = encoder.transform(y_test_raw)
+
+    # 5. Tách validation từ train
+    X_train_final, X_val, y_train_final, y_val = create_validation_set(
+        X_train_proc, y_train_enc, val_size=0.1
+    )
+
+    # 6. Class weights
+    class_weights = compute_class_weights(y_train_final)
+    print(f"\n⚖️  Class weights: {class_weights}")
+
+    # 7. Augmentation generator (dùng ngay khi training)
     datagen = create_augmentation_generator()
-    
-    # 6. Lưu dữ liệu đã xử lý
+
+    # 8. Lưu
     save_preprocessed_data(
         X_train_final, y_train_final,
         X_val, y_val,
-        X_test_processed, y_test_encoded,
-        encoder
+        X_test_proc, y_test_enc,
+        encoder, class_weights,
     )
-    
-    # 7. Trực quan hóa dữ liệu
+
+    # 9. Visualize
     visualize_samples(X_train_final, y_train_final)
-    
-    # 8. In kết quả
-    print("\n" + "="*60)
-    print(" TIỀN XỬ LÝ DỮ LIỆU HOÀN TẤT!")
-    print("="*60)
-    print("\n OUTPUT:")
-    print("   utils/preprocessed_data.pkl - Dữ liệu đã xử lý")
-    print("   utils/data_samples.png - Ảnh mẫu kiểm tra")
-    
+    visualize_split_distribution(y_train_final, y_val, y_test_enc)
+
+    print("\n" + "=" * 60)
+    print("✨ PREPROCESSING HOÀN TẤT!")
+    print("=" * 60)
+
     return {
-        'X_train': X_train_final,
-        'y_train': y_train_final,
-        'X_val': X_val,
-        'y_val': y_val,
-        'X_test': X_test_processed,
-        'y_test': y_test_encoded,
-        'encoder': encoder
+        'X_train':       X_train_final,
+        'y_train':       y_train_final,
+        'X_val':         X_val,
+        'y_val':         y_val,
+        'X_test':        X_test_proc,
+        'y_test':        y_test_enc,
+        'encoder':       encoder,
+        'class_weights': class_weights,
+        'datagen':       datagen,
     }
 
 
-# HÀM TIỆN ÍCH CHO MEMBER 
-
-def load_preprocessed_data():
-   
-    with open('utils/preprocessed_data.pkl', 'rb') as f:
-        data = pickle.load(f)
-    
-    print("\n Đã load dữ liệu đã tiền xử lý:")
-    print(f"  - Train: {data['X_train'].shape}")
-    print(f"  - Validation: {data['X_val'].shape}")
-    print(f"  - Test: {data['X_test'].shape}")
-    
-    return data
-
-
-# CHẠY CHÍNH 
 if __name__ == '__main__':
-    # Chạy pipeline
     data = main()
-    
-    # Kiểm tra nhanh dữ liệu
-    print("\n KIỂM TRA DỮ LIỆU:")
-    print(f"  - X_train dtype: {data['X_train'].dtype}")
-    print(f"  - X_train range: [{data['X_train'].min():.3f}, {data['X_train'].max():.3f}]")
-    print(f"  - y_train shape: {data['y_train'].shape}")
-    print(f"  - Sample label: {EMOTION_NAMES[np.argmax(data['y_train'][0])]}")
-
+    print("\n✅ Sẵn sàng training! Dùng file utils/preprocessed_data.pkl")
