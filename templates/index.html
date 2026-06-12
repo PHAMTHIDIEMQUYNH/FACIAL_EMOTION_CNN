@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Facial Emotion Recognition - CNN</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header>
+        <h1>NHẬN DIỆN CẢM XÚC KHUÔN MẶT SỬ DỤNG CNN</h1>
+        <p>Facial Emotion Recognition System using Convolutional Neural Network</p>
+    </header>
+    <div class="container">
+        <div class="card camera-card">
+            <div class="card-header">
+                <h2>WEBCAM</h2>
+                <span class="status-badge" id="cameraStatus">Chưa kết nối</span>
+            </div>
+            <div class="video-wrapper">
+                <video id="video" autoplay playsinline muted></video>
+                <canvas id="canvas" style="display: none;"></canvas>
+                <div class="video-placeholder" id="videoPlaceholder">
+                    <div class="placeholder-icon">📷</div>
+                    <p>Nhấn "Bật Camera" để bắt đầu</p>
+                </div>
+            </div>
+            <div class="button-group">
+                <button id="startBtn" class="btn btn-primary">BẬT CAMERA</button>
+                <button id="captureBtn" class="btn btn-success" disabled>NHẬN DIỆN</button>
+            </div>
+            <div class="input-info">
+                Input: 48x48 pixels | CLAHE
+            </div>
+        </div>
+        <div class="card result-card">
+            <div class="card-header">
+                <h2>KẾT QUẢ NHẬN DIỆN</h2>
+                <span class="status-badge" id="predictStatus">Chờ dự đoán</span>
+            </div>
+            <div class="emotion-main">
+                <div class="emotion-name" id="emotionName">Chưa nhận diện</div>
+                <div class="confidence-ring">
+                    <svg viewBox="0 0 100 100">
+                        <circle cx="50" cy="50" r="45" fill="none" stroke="#e9ecef" stroke-width="6"/>
+                        <circle cx="50" cy="50" r="45" fill="none" stroke="#4f46e5" stroke-width="6" 
+                                stroke-dasharray="282.74" stroke-dashoffset="282.74" id="confidenceArc"/>
+                    </svg>
+                    <div class="confidence-text">
+                        <span id="confidenceValue">0</span><span>%</span>
+                    </div>
+                </div>
+            </div>
+            <div class="probabilities">
+                <h3>XÁC SUẤT CẢM XÚC</h3>
+                <div id="emotionBars" class="emotion-bars-list"></div>
+            </div>
+        </div>
+    </div>
+    <div class="info-grid">
+        <div class="card model-card">
+            <div class="card-header">
+                <h2>THÔNG TIN MÔ HÌNH CNN</h2>
+            </div>
+            <div class="model-stats">
+                <div class="stat-row"><span class="stat-label">Dataset:</span><span>FER2013 + CK+ + JAFFE + SFEW</span></div>
+                <div class="stat-row"><span class="stat-label">Input Size:</span><span>48 × 48 pixels</span></div>
+                <div class="stat-row"><span class="stat-label">Số lớp:</span><span>7 cảm xúc</span></div>
+                <div class="stat-row"><span class="stat-label">Tiền xử lý:</span><span>CLAHE</span></div>
+                <div class="stat-row"><span class="stat-label">Framework:</span><span>TensorFlow / Keras</span></div>
+            </div>
+            <div class="emotion-tags">
+                <span>Angry</span><span>Disgust</span><span>Fear</span>
+                <span>Happy</span><span>Sad</span><span>Surprise</span><span>Neutral</span>
+            </div>
+        </div>
+
+        <div class="card dataset-card">
+            <div class="card-header">
+                <h2>PHÂN BỐ DỮ LIỆU</h2>
+            </div>
+            <img src="{{ url_for('static', filename='split_distribution.png') }}" alt="Dataset Distribution" class="dataset-img" onerror="this.style.display='none'">
+            <div class="dataset-legend">
+                <span><span class="legend-train"></span> Train (37.102)</span>
+                <span><span class="legend-val"></span> Val (4.123)</span>
+                <span><span class="legend-test"></span> Test (8.468)</span>
+            </div>
+        </div>
+    </div>
+    <div class="card log-card">
+        <div class="card-header">
+            <h2>LỊCH SỬ NHẬN DIỆN</h2>
+            <button id="clearLogBtn" class="btn-clear">Xóa</button>
+        </div>
+        <div id="detectionLog" class="log-content">
+            <div class="log-empty">Chưa có kết quả nhận diện nào</div>
+        </div>
+    </div>
+    <img id="capturedImage" style="display: none;">
+
+    <script src="{{ url_for('static', filename='webcam_handler.js') }}"></script>
+</body>
+</html>
